@@ -4,14 +4,33 @@ translate_textbook_v2.py — แปลตำราขนาดใหญ่ด้
 รองรับเพิ่ม: PDF ที่สมการเป็น image (detect + rasterize + LaTeX)
 """
 
-import anthropic
+try:
+    import anthropic
+except ModuleNotFoundError:
+    anthropic = None
 import base64, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 # ──────────────────────────────────────────────
 # 1. CONFIG
 # ──────────────────────────────────────────────
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+_client = None
+
+def get_client():
+    """สร้าง Anthropic client แบบ lazy เพื่อให้ import/help/test ได้แม้ยังไม่ได้ตั้ง API key"""
+    global _client
+    if _client is not None:
+        return _client
+    if anthropic is None:
+        raise RuntimeError("ไม่พบ package anthropic: ติดตั้งด้วย `pip install anthropic`")
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ไม่พบ ANTHROPIC_API_KEY: ตั้งค่าก่อนรัน เช่น export ANTHROPIC_API_KEY='...' ")
+    _client = anthropic.Anthropic(api_key=api_key)
+    return _client
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    return anthropic is not None and isinstance(exc, getattr(anthropic, "RateLimitError", ()))
 
 MODEL_TEXT  = "claude-sonnet-4-6"   # แปลข้อความ — เร็ว คุ้มค่า
 MODEL_IMAGE = "claude-sonnet-4-6"   # อ่านสมการจากภาพ (vision)
@@ -91,7 +110,7 @@ def extract_equations_from_image(img_path: Path) -> str:
     """ส่งภาพให้ Claude อ่าน แล้วดึงสมการเป็น LaTeX"""
     img_data = base64.standard_b64encode(img_path.read_bytes()).decode("utf-8")
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model=MODEL_IMAGE,
         max_tokens=4096,
         messages=[{
@@ -162,11 +181,11 @@ def split_into_chunks(text: str, chapter_id: str = "CH00",
     """
     แบ่งตาม heading, ใส่ Chunk ID (CH01-S001), ใส่ overlap 2 ย่อหน้า
     """
-    parts = re.split(r'(\n#{1,3} [^\n]+)', text)
+    parts = re.split(r'(\n?#{1,3} [^\n]+)', text)
     raw_chunks, current, heading = [], "", ""
 
     for part in parts:
-        if re.match(r'\n#{1,3} ', part):
+        if re.match(r'\n?#{1,3} ', part):
             if current.strip():
                 raw_chunks.append({"heading": heading, "text": current.strip()})
             heading, current = part.strip(), part + "\n"
@@ -216,7 +235,7 @@ def translate_chunk(chunk: dict, system_prompt: str) -> str:
 {chunk['text']}
 ======================"""
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model=MODEL_TEXT,
         system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],
@@ -230,7 +249,8 @@ def translate_chunk(chunk: dict, system_prompt: str) -> str:
 # 8. TRANSLATE PAGE (image mode — สำหรับ PDF ที่สมการเป็น image)
 # ──────────────────────────────────────────────
 def translate_page_with_image(pdf_path: str, page_num: int,
-                               system_prompt: str, chunk_id: str) -> str:
+                               system_prompt: str, chunk_id: str,
+                               return_raw: bool = False) -> str | tuple[str, str]:
     """
     สำหรับหน้าที่สมการเป็น image:
     1. rasterize หน้า
@@ -240,7 +260,8 @@ def translate_page_with_image(pdf_path: str, page_num: int,
     print(f"    📸 rasterize หน้า {page_num}...")
     img_path = rasterize_page(pdf_path, page_num)
     if not img_path:
-        return f"[ERROR: ไม่สามารถ rasterize หน้า {page_num}]"
+        err = f"[ERROR: ไม่สามารถ rasterize หน้า {page_num}]"
+        return (err, "") if return_raw else err
 
     print(f"    🔢 ดึงสมการจากภาพ...")
     raw_content = extract_equations_from_image(img_path)
@@ -256,14 +277,15 @@ def translate_page_with_image(pdf_path: str, page_num: int,
 - แปลเฉพาะข้อความบรรยายภาษาอังกฤษ → ภาษาไทย
 - คงหมายเลขสมการ (X.Y) ไว้"""
 
-    response = client.messages.create(
+    response = get_client().messages.create(
         model=MODEL_TEXT,
         system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],
         max_tokens=MAX_TOKENS,
         temperature=TEMP,
     )
-    return response.content[0].text
+    translated = response.content[0].text
+    return (translated, raw_content) if return_raw else translated
 
 
 # ──────────────────────────────────────────────
@@ -328,7 +350,8 @@ def translate_text_book(input_file: str, glossary_path: str = None,
     done: dict = {}
     if CHECKPOINT.exists():
         done = json.loads(CHECKPOINT.read_text()).get("done", {})
-        print(f"↪️  resume: {len(done)}/{total} chunks แปลไปแล้ว")
+        already = sum(1 for c in chunks if c["id"] in done)
+        print(f"↪️  resume: {already}/{total} chunks แปลไปแล้ว")
 
     qc_log = []
     for chunk in chunks:
@@ -341,7 +364,9 @@ def translate_text_book(input_file: str, glossary_path: str = None,
         print(f"  🔄 {cid}: {chunk['heading'][:50]}")
         try:
             translated = translate_chunk(chunk, system_prompt)
-        except anthropic.RateLimitError:
+        except Exception as e:
+            if not is_rate_limit_error(e):
+                raise
             print("  ⚠️  Rate limit — รอ 60 วิ")
             time.sleep(60)
             translated = translate_chunk(chunk, system_prompt)
@@ -355,7 +380,7 @@ def translate_text_book(input_file: str, glossary_path: str = None,
         done[cid] = True
         cp = json.loads(CHECKPOINT.read_text()) if CHECKPOINT.exists() else {}
         cp["done"] = done
-        CHECKPOINT.write_text(json.dumps(cp))
+        CHECKPOINT.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
         time.sleep(DELAY_SEC)
 
     _merge_and_report(chunks, qc_log, chapter_id)
@@ -373,6 +398,10 @@ def translate_pdf_image_mode(pdf_path: str, start_page: int, end_page: int,
     system_prompt = build_system_prompt(glossary_path)
     total = end_page - start_page + 1
     print(f"📸 {chapter_id}: image mode หน้า {start_page}–{end_page} ({total} หน้า)")
+    page_chunks = [
+        {"id": f"{chapter_id}-P{p:04d}", "seq": p - start_page, "heading": "", "text": "", "overlap": ""}
+        for p in range(start_page, end_page + 1)
+    ]
 
     done: dict = {}
     if CHECKPOINT.exists():
@@ -391,15 +420,19 @@ def translate_pdf_image_mode(pdf_path: str, start_page: int, end_page: int,
 
         print(f"  🔄 {cid} (หน้า {page_num}/{end_page})")
         try:
-            translated = translate_page_with_image(pdf_path, page_num,
-                                                    system_prompt, cid)
-        except anthropic.RateLimitError:
+            translated, raw_content = translate_page_with_image(pdf_path, page_num,
+                                                                 system_prompt, cid,
+                                                                 return_raw=True)
+        except Exception as e:
+            if not is_rate_limit_error(e):
+                raise
             print("  ⚠️  Rate limit — รอ 60 วิ")
             time.sleep(60)
-            translated = translate_page_with_image(pdf_path, page_num,
-                                                    system_prompt, cid)
+            translated, raw_content = translate_page_with_image(pdf_path, page_num,
+                                                                 system_prompt, cid,
+                                                                 return_raw=True)
 
-        issues = qc_check(cid, "", translated, eq_mode="image")
+        issues = qc_check(cid, raw_content, translated, eq_mode="image")
         if issues:
             qc_log.append({"chunk": cid, "issues": issues})
             print(f"  ⚠️  QC: {issues}")
@@ -408,8 +441,10 @@ def translate_pdf_image_mode(pdf_path: str, start_page: int, end_page: int,
         done[cid] = True
         cp = json.loads(CHECKPOINT.read_text()) if CHECKPOINT.exists() else {}
         cp["done"] = done
-        CHECKPOINT.write_text(json.dumps(cp))
+        CHECKPOINT.write_text(json.dumps(cp, ensure_ascii=False, indent=2))
         time.sleep(DELAY_SEC * 2)   # image mode ช้ากว่า — หน่วงเพิ่ม
+
+    _merge_and_report(page_chunks, qc_log, chapter_id)
 
 
 # ──────────────────────────────────────────────
